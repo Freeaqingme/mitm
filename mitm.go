@@ -27,18 +27,17 @@ type Proxy struct {
 	// response body.
 	// If zero, no periodic flushing is done.
 	FlushInterval time.Duration
+
+	ModifyResponse func(*http.Response) error
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "CONNECT" {
+	if r.Method == http.MethodConnect {
 		p.serveConnect(w, r)
 		return
 	}
-	rp := &httputil.ReverseProxy{
-		Director:      httpDirector,
-		FlushInterval: p.FlushInterval,
-	}
-	p.Wrap(rp).ServeHTTP(w, r)
+
+	p.Wrap(p.getReverseProxy(httpDirector)).ServeHTTP(w, r)
 }
 
 func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
@@ -49,18 +48,24 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cconn.Close()
 
-	rp := &httputil.ReverseProxy{
-		Director:      httpsDirector,
-		FlushInterval: p.FlushInterval,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
-
 	ch := make(chan struct{}, 0)
 	wc := &onCloseConn{cconn, func() { ch <- struct{}{} }}
-	http.Serve(&oneShotListener{wc}, p.Wrap(rp))
+	http.Serve(&oneShotListener{wc}, p.Wrap(p.getReverseProxy(httpsDirector)))
 	<-ch
+}
+
+func (p *Proxy) getReverseProxy(director func(r *http.Request)) *httputil.ReverseProxy {
+	ret := &httputil.ReverseProxy{
+		Director:      director,
+		FlushInterval: p.FlushInterval,
+		//Transport:     p,
+	}
+
+	if p.ModifyResponse != nil {
+		ret.ModifyResponse = p.ModifyResponse
+	}
+
+	return ret
 }
 
 func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
