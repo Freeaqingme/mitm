@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"sync"
 	"time"
 )
 
@@ -22,14 +21,6 @@ type Proxy struct {
 	// CA specifies the root CA for generating leaf certs for each incoming
 	// TLS request.
 	CA *tls.Certificate
-
-	// TLSServerConfig specifies the tls.Config to use when generating leaf
-	// cert using CA.
-	TLSServerConfig *tls.Config
-
-	// TLSClientConfig specifies the tls.Config to use when establishing
-	// an upstream connection for proxying.
-	TLSClientConfig *tls.Config
 
 	// FlushInterval specifies the flush interval
 	// to flush to the client while copying the
@@ -51,71 +42,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
-	var (
-		err   error
-		sconn *tls.Conn
-		name  = dnsName(r.Host)
-	)
-
-	if name == "" {
-		log.Println("cannot determine cert name for " + r.Host)
-		http.Error(w, "no upstream", 503)
-		return
-	}
-
-	provisionalCert, err := p.cert(name)
-	if err != nil {
-		log.Println("cert", err)
-		http.Error(w, "no upstream", 503)
-		return
-	}
-
-	sConfig := new(tls.Config)
-	if p.TLSServerConfig != nil {
-		*sConfig = *p.TLSServerConfig
-	}
-	sConfig.Certificates = []tls.Certificate{*provisionalCert}
-	sConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		cConfig := new(tls.Config)
-		if p.TLSClientConfig != nil {
-			*cConfig = *p.TLSClientConfig
-		}
-		cConfig.ServerName = hello.ServerName
-		sconn, err = tls.Dial("tcp", r.Host, cConfig)
-		if err != nil {
-			log.Println("dial", r.Host, err)
-			return nil, err
-		}
-		return p.cert(hello.ServerName)
-	}
-
-	cconn, err := handshake(w, sConfig)
+	cconn, err := p.handshake(w)
 	if err != nil {
 		log.Println("handshake", r.Host, err)
 		return
 	}
 	defer cconn.Close()
-	if sconn == nil {
-		log.Println("could not determine cert name for " + r.Host)
-		return
-	}
-	defer sconn.Close()
 
-	od := &oneShotDialer{c: sconn}
 	rp := &httputil.ReverseProxy{
 		Director:      httpsDirector,
-		Transport:     &http.Transport{DialTLS: od.Dial},
 		FlushInterval: p.FlushInterval,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
 	}
 
-	ch := make(chan int)
-	wc := &onCloseConn{cconn, func() { ch <- 0 }}
+	ch := make(chan struct{}, 0)
+	wc := &onCloseConn{cconn, func() { ch <- struct{}{} }}
 	http.Serve(&oneShotListener{wc}, p.Wrap(rp))
 	<-ch
 }
 
 func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
-	return genCert(p.CA, names)
+	return p.CA, nil
 }
 
 var okHeader = []byte("HTTP/1.1 200 OK\r\n\r\n")
@@ -123,7 +72,7 @@ var okHeader = []byte("HTTP/1.1 200 OK\r\n\r\n")
 // handshake hijacks w's underlying net.Conn, responds to the CONNECT request
 // and manually performs the TLS handshake. It returns the net.Conn or and
 // error if any.
-func handshake(w http.ResponseWriter, config *tls.Config) (net.Conn, error) {
+func (p *Proxy) handshake(w http.ResponseWriter) (net.Conn, error) {
 	raw, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		http.Error(w, "no upstream", 503)
@@ -133,7 +82,10 @@ func handshake(w http.ResponseWriter, config *tls.Config) (net.Conn, error) {
 		raw.Close()
 		return nil, err
 	}
-	conn := tls.Server(raw, config)
+
+	conn := tls.Server(raw, &tls.Config{
+		Certificates: []tls.Certificate{*p.CA},
+	})
 	err = conn.Handshake()
 	if err != nil {
 		conn.Close()
@@ -153,48 +105,7 @@ func httpsDirector(r *http.Request) {
 	r.URL.Scheme = "https"
 }
 
-// dnsName returns the DNS name in addr, if any.
-func dnsName(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return ""
-	}
-	return host
-}
-
-// namesOnCert returns the dns names
-// in the peer's presented cert.
-func namesOnCert(conn *tls.Conn) []string {
-	// TODO(kr): handle IP addr SANs.
-	c := conn.ConnectionState().PeerCertificates[0]
-	if len(c.DNSNames) > 0 {
-		// If Subject Alt Name is given,
-		// we ignore the common name.
-		// This matches behavior of crypto/x509.
-		return c.DNSNames
-	}
-	return []string{c.Subject.CommonName}
-}
-
-// A oneShotDialer implements net.Dialer whos Dial only returns a
-// net.Conn as specified by c followed by an error for each subsequent Dial.
-type oneShotDialer struct {
-	c  net.Conn
-	mu sync.Mutex
-}
-
-func (d *oneShotDialer) Dial(network, addr string) (net.Conn, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.c == nil {
-		return nil, errors.New("closed")
-	}
-	c := d.c
-	d.c = nil
-	return c, nil
-}
-
-// A oneShotListener implements net.Listener whos Accept only returns a
+// A oneShotListener implements net.Listener whose Accept only returns a
 // net.Conn as specified by c followed by an error for each subsequent Accept.
 type oneShotListener struct {
 	c net.Conn
